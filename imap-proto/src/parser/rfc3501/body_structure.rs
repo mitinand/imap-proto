@@ -3,6 +3,7 @@ use nom::{
     bytes::streaming::{tag, tag_no_case},
     character::streaming::char,
     combinator::{map, opt},
+    error::{Error, ErrorKind},
     multi::many1,
     sequence::{delimited, preceded, tuple},
     IResult,
@@ -13,6 +14,18 @@ use crate::{
     parser::{core::*, rfc3501::envelope},
     types::*,
 };
+
+/// Maximum number of nested `body` levels (multipart parts and encapsulated
+/// messages) accepted in a BODYSTRUCTURE. Parsing is recursive, so without a
+/// limit a deeply nested response from the server overflows the stack.
+const MAX_BODY_NESTING: usize = 32;
+
+/// Maximum number of nested lists accepted in a `body-extension`.
+const MAX_BODY_EXTENSION_NESTING: usize = 16;
+
+fn nesting_too_deep(i: &[u8]) -> nom::Err<Error<&[u8]>> {
+    nom::Err::Failure(Error::new(i, ErrorKind::TooLarge))
+}
 
 // body-fields     = body-fld-param SP body-fld-id SP body-fld-desc SP
 //                   body-fld-enc SP body-fld-octets
@@ -136,16 +149,29 @@ fn body_param(i: &[u8]) -> IResult<&[u8], BodyParams<'_>> {
 }
 
 fn body_extension(i: &[u8]) -> IResult<&[u8], BodyExtension<'_>> {
+    body_extension_nested(i, MAX_BODY_EXTENSION_NESTING)
+}
+
+fn body_extension_nested(i: &[u8], remaining: usize) -> IResult<&[u8], BodyExtension<'_>> {
     alt((
         map(number, BodyExtension::Num),
         // Cannot find documentation on character encoding for body extension values.
         // So far, assuming UTF-8 seems fine, please report if you run into issues here.
         map(nstring_utf8, BodyExtension::Str),
-        map(
-            parenthesized_nonempty_list(body_extension),
-            BodyExtension::List,
-        ),
+        move |i| body_extension_list(i, remaining),
     ))(i)
+}
+
+fn body_extension_list(i: &[u8], remaining: usize) -> IResult<&[u8], BodyExtension<'_>> {
+    let remaining = match remaining.checked_sub(1) {
+        Some(remaining) => remaining,
+        None if i.first() == Some(&b'(') => return Err(nesting_too_deep(i)),
+        None => return Err(nom::Err::Error(Error::new(i, ErrorKind::Char))),
+    };
+    map(
+        parenthesized_nonempty_list(move |i| body_extension_nested(i, remaining)),
+        BodyExtension::List,
+    )(i)
 }
 
 fn body_disposition(i: &[u8]) -> IResult<&[u8], Option<ContentDisposition<'_>>> {
@@ -227,7 +253,7 @@ fn body_type_text(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
     )(i)
 }
 
-fn body_type_message(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
+fn body_type_message(i: &[u8], remaining: usize) -> IResult<&[u8], BodyStructure<'_>> {
     map(
         tuple((
             tag_no_case("\"MESSAGE\" \"RFC822\""),
@@ -236,7 +262,7 @@ fn body_type_message(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
             tag(" "),
             envelope,
             tag(" "),
-            body,
+            move |i| body_nested(i, remaining),
             tag(" "),
             number,
             body_ext_1part,
@@ -267,9 +293,14 @@ fn body_type_message(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
     )(i)
 }
 
-fn body_type_multipart(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
+fn body_type_multipart(i: &[u8], remaining: usize) -> IResult<&[u8], BodyStructure<'_>> {
     map(
-        tuple((many1(body), tag(" "), string_utf8, body_ext_mpart)),
+        tuple((
+            many1(move |i| body_nested(i, remaining)),
+            tag(" "),
+            string_utf8,
+            body_ext_mpart,
+        )),
         |(bodies, _, subtype, ext)| BodyStructure::Multipart {
             common: BodyContentCommon {
                 ty: ContentType {
@@ -288,11 +319,19 @@ fn body_type_multipart(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
 }
 
 pub(crate) fn body(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
+    body_nested(i, MAX_BODY_NESTING)
+}
+
+fn body_nested(i: &[u8], remaining: usize) -> IResult<&[u8], BodyStructure<'_>> {
+    let remaining = match remaining.checked_sub(1) {
+        Some(remaining) => remaining,
+        None => return Err(nesting_too_deep(i)),
+    };
     paren_delimited(alt((
         body_type_text,
-        body_type_message,
+        move |i| body_type_message(i, remaining),
         body_type_basic,
-        body_type_multipart,
+        move |i| body_type_multipart(i, remaining),
     )))(i)
 }
 
@@ -521,5 +560,78 @@ mod tests {
                 });
             }
         );
+    }
+
+    const TEXT_LEAF: &str = r#"("TEXT" "PLAIN" NIL NIL NIL "7BIT" 1 1)"#;
+
+    /// `levels` nested `body` levels: encapsulated messages around a text part.
+    fn nested_messages(levels: usize) -> String {
+        let wrapper = r#"("MESSAGE" "RFC822" NIL NIL NIL "7BIT" 10 (NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL) "#;
+        let mut body = wrapper.repeat(levels - 1);
+        body.push_str(TEXT_LEAF);
+        body.push_str(&" 1)".repeat(levels - 1));
+        body
+    }
+
+    /// `levels` nested `body` levels: multiparts around a text part.
+    fn nested_multiparts(levels: usize) -> String {
+        let mut body = "(".repeat(levels - 1);
+        body.push_str(TEXT_LEAF);
+        body.push_str(&r#" "MIXED")"#.repeat(levels - 1));
+        body
+    }
+
+    fn assert_too_deep(result: IResult<&[u8], impl std::fmt::Debug>) {
+        assert_matches!(
+            result,
+            Err(nom::Err::Failure(Error {
+                code: ErrorKind::TooLarge,
+                ..
+            }))
+        );
+    }
+
+    #[test]
+    fn test_body_structure_nesting_at_limit() {
+        assert_matches!(
+            body(nested_messages(MAX_BODY_NESTING).as_bytes()),
+            Ok((EMPTY, BodyStructure::Message { .. }))
+        );
+        assert_matches!(
+            body(nested_multiparts(MAX_BODY_NESTING).as_bytes()),
+            Ok((EMPTY, BodyStructure::Multipart { .. }))
+        );
+    }
+
+    #[test]
+    fn test_body_structure_nesting_over_limit() {
+        assert_too_deep(body(nested_messages(MAX_BODY_NESTING + 1).as_bytes()));
+        assert_too_deep(body(nested_multiparts(MAX_BODY_NESTING + 1).as_bytes()));
+    }
+
+    #[test]
+    fn test_body_structure_hostile_nesting() {
+        // Deep enough to overflow the stack without a limit.
+        assert_too_deep(body(nested_messages(100_000).as_bytes()));
+        assert_too_deep(body(nested_multiparts(100_000).as_bytes()));
+    }
+
+    #[test]
+    fn test_body_extension_nesting() {
+        let nested = |levels: usize| format!("{}1{}", "(".repeat(levels), ")".repeat(levels));
+        assert_matches!(
+            body_extension(nested(MAX_BODY_EXTENSION_NESTING).as_bytes()),
+            Ok((EMPTY, BodyExtension::List(_)))
+        );
+        assert_too_deep(body_extension(
+            nested(MAX_BODY_EXTENSION_NESTING + 1).as_bytes(),
+        ));
+        assert_too_deep(body_extension(nested(100_000).as_bytes()));
+    }
+
+    #[test]
+    fn test_fetch_response_with_hostile_nesting() {
+        let response = format!("* 1 FETCH (BODYSTRUCTURE {})\r\n", nested_messages(100_000));
+        assert!(crate::parser::parse_response(response.as_bytes()).is_err());
     }
 }
