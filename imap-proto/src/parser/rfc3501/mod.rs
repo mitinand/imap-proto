@@ -401,10 +401,10 @@ fn address(i: &[u8]) -> IResult<&[u8], Address<'_>> {
             nstring,
         )),
         |(name, _, adl, _, mailbox, _, host)| Address {
-            name: name.map(Cow::Borrowed),
-            adl: adl.map(Cow::Borrowed),
-            mailbox: mailbox.map(Cow::Borrowed),
-            host: host.map(Cow::Borrowed),
+            name,
+            adl,
+            mailbox,
+            host,
         },
     ))(i)
 }
@@ -486,16 +486,16 @@ pub(crate) fn envelope(i: &[u8]) -> IResult<&[u8], Envelope<'_>> {
             _,
             message_id,
         )| Envelope {
-            date: date.map(Cow::Borrowed),
-            subject: subject.map(Cow::Borrowed),
+            date,
+            subject,
             from,
             sender,
             reply_to,
             to,
             cc,
             bcc,
-            in_reply_to: in_reply_to.map(Cow::Borrowed),
-            message_id: message_id.map(Cow::Borrowed),
+            in_reply_to,
+            message_id,
         },
     ))(i)
 }
@@ -522,7 +522,7 @@ fn msg_att_flags(i: &[u8]) -> IResult<&[u8], AttributeValue<'_>> {
 
 fn msg_att_rfc822(i: &[u8]) -> IResult<&[u8], AttributeValue<'_>> {
     map(preceded(tag_no_case("RFC822 "), nstring), |v| {
-        AttributeValue::Rfc822(v.map(Cow::Borrowed))
+        AttributeValue::Rfc822(v)
     })(i)
 }
 
@@ -530,7 +530,7 @@ fn msg_att_rfc822_header(i: &[u8]) -> IResult<&[u8], AttributeValue<'_>> {
     // extra space workaround for DavMail
     map(
         tuple((tag_no_case("RFC822.HEADER "), opt(tag(b" ")), nstring)),
-        |(_, _, raw)| AttributeValue::Rfc822Header(raw.map(Cow::Borrowed)),
+        |(_, _, raw)| AttributeValue::Rfc822Header(raw),
     )(i)
 }
 
@@ -543,7 +543,7 @@ fn msg_att_rfc822_size(i: &[u8]) -> IResult<&[u8], AttributeValue<'_>> {
 
 fn msg_att_rfc822_text(i: &[u8]) -> IResult<&[u8], AttributeValue<'_>> {
     map(preceded(tag_no_case("RFC822.TEXT "), nstring), |v| {
-        AttributeValue::Rfc822Text(v.map(Cow::Borrowed))
+        AttributeValue::Rfc822Text(v)
     })(i)
 }
 

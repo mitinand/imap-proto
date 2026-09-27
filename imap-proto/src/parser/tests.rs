@@ -49,6 +49,18 @@ fn test_name_attributes() {
     }
 }
 
+/// A quoted mailbox name is the name without its escapes, the string a
+/// client quotes again to select the mailbox.
+#[test]
+fn test_quoted_mailbox_name_is_unescaped() {
+    match parse_response(b"* LIST () \"/\" \"a\\\"b\\\\c\"\r\n") {
+        Ok((_, Response::MailboxData(MailboxDatum::List { name, .. }))) => {
+            assert_eq!(name, "a\"b\\c");
+        }
+        rsp => panic!("unexpected response {rsp:?}"),
+    }
+}
+
 /// Test the ACL response from RFC 4314/2086
 #[test]
 fn test_acl_response() {

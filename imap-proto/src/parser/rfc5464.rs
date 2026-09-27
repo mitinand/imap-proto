@@ -113,14 +113,19 @@ fn check_entry_name(i: &[u8]) -> IResult<&[u8], &[u8]> {
     }
 }
 
-fn entry_name(i: &[u8]) -> IResult<&[u8], &[u8]> {
-    let astring_res = astring(i)?;
-    check_entry_name(astring_res.1)?;
-    Ok(astring_res)
+fn entry_name(i: &[u8]) -> IResult<&[u8], Cow<'_, str>> {
+    let (rest, name) = astring(i)?;
+    // The check reads the parsed name, which may be an unescaped copy, so
+    // its error points at the start of the name in the input.
+    check_entry_name(&name).map_err(|error| error.map_input(|_| i))?;
+    Ok((rest, to_str(name)))
 }
 
-fn slice_to_str(i: &[u8]) -> &str {
-    std::str::from_utf8(i).unwrap()
+fn to_str(bytes: Cow<'_, [u8]>) -> Cow<'_, str> {
+    match bytes {
+        Cow::Borrowed(bytes) => Cow::Borrowed(std::str::from_utf8(bytes).unwrap()),
+        Cow::Owned(bytes) => Cow::Owned(String::from_utf8(bytes).unwrap()),
+    }
 }
 
 fn nil_value(i: &[u8]) -> IResult<&[u8], Option<String>> {
@@ -128,32 +133,26 @@ fn nil_value(i: &[u8]) -> IResult<&[u8], Option<String>> {
 }
 
 fn string_value(i: &[u8]) -> IResult<&[u8], Option<String>> {
-    map(alt((quoted, literal)), |s| {
-        Some(slice_to_str(s).to_string())
-    })(i)
+    map(string, |s| Some(to_str(s).into_owned()))(i)
 }
 
 fn keyval_list(i: &[u8]) -> IResult<&[u8], Vec<Metadata>> {
     parenthesized_nonempty_list(map(
-        tuple((
-            map(entry_name, slice_to_str),
-            tag(" "),
-            alt((nil_value, string_value)),
-        )),
+        tuple((entry_name, tag(" "), alt((nil_value, string_value)))),
         |(key, _, value)| Metadata {
-            entry: key.to_string(),
+            entry: key.into_owned(),
             value,
         },
     ))(i)
 }
 
 fn entry_list(i: &[u8]) -> IResult<&[u8], Vec<Cow<'_, str>>> {
-    separated_list0(tag(" "), map(map(entry_name, slice_to_str), Cow::Borrowed))(i)
+    separated_list0(tag(" "), entry_name)(i)
 }
 
-fn metadata_common(i: &[u8]) -> IResult<&[u8], &[u8]> {
+fn metadata_common(i: &[u8]) -> IResult<&[u8], Cow<'_, str>> {
     let (i, (_, mbox, _)) = tuple((tag_no_case("METADATA "), quoted, tag(" ")))(i)?;
-    Ok((i, mbox))
+    Ok((i, to_str(mbox)))
 }
 
 // [RFC5464 - 4.4.1 METADATA Response with values]
@@ -161,10 +160,7 @@ pub(crate) fn metadata_solicited(i: &[u8]) -> IResult<&[u8], Response<'_>> {
     let (i, (mailbox, values)) = tuple((metadata_common, keyval_list))(i)?;
     Ok((
         i,
-        Response::MailboxData(MailboxDatum::MetadataSolicited {
-            mailbox: Cow::Borrowed(slice_to_str(mailbox)),
-            values,
-        }),
+        Response::MailboxData(MailboxDatum::MetadataSolicited { mailbox, values }),
     ))
 }
 
@@ -173,10 +169,7 @@ pub(crate) fn metadata_unsolicited(i: &[u8]) -> IResult<&[u8], Response<'_>> {
     let (i, (mailbox, values)) = tuple((metadata_common, entry_list))(i)?;
     Ok((
         i,
-        Response::MailboxData(MailboxDatum::MetadataUnsolicited {
-            mailbox: Cow::Borrowed(slice_to_str(mailbox)),
-            values,
-        }),
+        Response::MailboxData(MailboxDatum::MetadataUnsolicited { mailbox, values }),
     ))
 }
 
