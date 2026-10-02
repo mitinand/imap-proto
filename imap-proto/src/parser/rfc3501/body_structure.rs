@@ -108,6 +108,9 @@ fn body_ext_mpart(i: &[u8]) -> IResult<&[u8], BodyExtMPart<'_>> {
     ))
 }
 
+// body-fld-enc is a string per RFC 3501, but some servers answer NIL for a
+// part without a Content-Transfer-Encoding header; that header's default is
+// 7BIT (RFC 2045 section 6.1), so NIL is read as that.
 fn body_encoding(i: &[u8]) -> IResult<&[u8], ContentEncoding<'_>> {
     alt((
         delimited(
@@ -123,6 +126,7 @@ fn body_encoding(i: &[u8]) -> IResult<&[u8], ContentEncoding<'_>> {
             )),
             char('"'),
         ),
+        map(tag_no_case("NIL"), |_| ContentEncoding::SevenBit),
         map(string_utf8, ContentEncoding::Other),
     ))(i)
 }
@@ -382,6 +386,28 @@ mod tests {
                 extension: None,
             },
         )
+    }
+
+    #[test]
+    fn test_body_encoding_data() {
+        assert_matches!(
+            body_encoding(br#""base64""#),
+            Ok((EMPTY, ContentEncoding::Base64))
+        );
+        assert_matches!(
+            body_encoding(br#""x-uuencode""#),
+            Ok((EMPTY, ContentEncoding::Other(encoding))) => {
+                assert_eq!(encoding, "x-uuencode");
+            }
+        );
+        assert_matches!(
+            body_encoding(b"NIL"),
+            Ok((EMPTY, ContentEncoding::SevenBit))
+        );
+        let (rest, fields) = body_fields(b"NIL NIL NIL NIL 1337)").unwrap();
+        assert_eq!(rest, b")");
+        assert_eq!(fields.transfer_encoding, ContentEncoding::SevenBit);
+        assert_eq!(fields.octets, 1337);
     }
 
     #[test]
